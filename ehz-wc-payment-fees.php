@@ -35,7 +35,147 @@ function bootstrap_ehz_wc_payment_fees(): void
         return;
     }
 
+    // Gondoskodunk róla, hogy a WooCommerce alap gateway osztályai betöltődjenek
+    // mielőtt a saját gateway osztályunkat definiálnánk.
+    load_offline_gateway_class();
+    add_action('woocommerce_loaded', __NAMESPACE__ . '\\load_offline_gateway_class');
+
     Plugin::instance();
+}
+
+/**
+ * Offline fizetési mód osztály betöltése csak akkor, ha a WooCommerce már elérhető.
+ */
+function load_offline_gateway_class(): void
+{
+    if (class_exists(__NAMESPACE__ . '\\OfflineGateway')) {
+        return;
+    }
+
+    if (! class_exists('\\WC_Payment_Gateway')) {
+        return;
+    }
+
+    /**
+     * Offline fizetési mód (ehz_wc_offline_cash)
+     */
+    final class OfflineGateway extends \WC_Payment_Gateway
+    {
+        protected string $instructions = '';
+
+        public function __construct()
+        {
+            $config = Plugin::$gateway_configs[get_class($this)] ?? null;
+
+            $this->id                 = $config['id'] ?? 'ehz_wc_offline_cash';
+            $this->method_title       = $config['method_title'] ?? __('Offline payment (EHZ)', 'ehz-wc-payment-fees');
+            $this->method_description = $config['method_description'] ?? __('Custom offline payment method provided by EHZ plugin.', 'ehz-wc-payment-fees');
+            $this->has_fields         = false;
+
+            // Load the settings.
+            $this->init_form_fields();
+            $this->init_settings();
+
+            $this->title        = $this->get_option('title', $config['title'] ?? __('Offline payment', 'ehz-wc-payment-fees'));
+            $this->description  = $this->get_option('description', $config['description'] ?? '');
+            $this->instructions = $this->get_option('instructions', $config['instructions'] ?? '');
+            $this->enabled      = $this->get_option('enabled', $config['enabled'] ?? 'no');
+
+            add_action('woocommerce_update_options_payment_gateways_' . $this->id, [$this, 'process_admin_options']);
+        }
+
+        public function init_form_fields(): void
+        {
+            $this->form_fields = [
+                'enabled' => [
+                    'title'   => __('Enable/Disable', 'ehz-wc-payment-fees'),
+                    'type'    => 'checkbox',
+                    'label'   => __('Enable this offline payment method', 'ehz-wc-payment-fees'),
+                    'default' => 'no',
+                ],
+                'title' => [
+                    'title'       => __('Title', 'ehz-wc-payment-fees'),
+                    'type'        => 'text',
+                    'description' => __('This controls the title which the user sees during checkout.', 'ehz-wc-payment-fees'),
+                    'default'     => __('Offline payment', 'ehz-wc-payment-fees'),
+                    'desc_tip'    => true,
+                ],
+                'description' => [
+                    'title'       => __('Description', 'ehz-wc-payment-fees'),
+                    'type'        => 'textarea',
+                    'description' => __('Payment method description that the customer will see on your checkout.', 'ehz-wc-payment-fees'),
+                    'default'     => '',
+                    'desc_tip'    => true,
+                ],
+                'instructions' => [
+                    'title'       => __('Instructions', 'ehz-wc-payment-fees'),
+                    'type'        => 'textarea',
+                    'description' => __('Instructions that will be added to the thank you page and emails.', 'ehz-wc-payment-fees'),
+                    'default'     => '',
+                    'desc_tip'    => true,
+                ],
+            ];
+        }
+
+        /**
+         * Output for the order received page.
+         */
+        public function thankyou_page(): void
+        {
+            if ($this->instructions) {
+                echo wpautop(wptexturize($this->instructions));
+            }
+        }
+
+        /**
+         * Add content to the WC emails.
+         */
+        public function email_instructions(\WC_Order $order, bool $sent_to_admin, bool $plain_text = false): void
+        {
+            if ($this->instructions && ! $sent_to_admin && $order->has_status('on-hold') && $order->get_payment_method() === $this->id) {
+                echo wpautop(wptexturize($this->instructions)) . PHP_EOL;
+            }
+        }
+
+        public function process_payment($order_id): array
+        {
+            $order = wc_get_order($order_id);
+
+            $order->update_status('on-hold', __('Awaiting offline payment', 'ehz-wc-payment-fees'));
+
+            $order->reduce_order_stock();
+
+            WC()->cart->empty_cart();
+
+            return [
+                'result'   => 'success',
+                'redirect' => $this->get_return_url($order),
+            ];
+        }
+
+        public function is_available(): bool
+        {
+            if ('yes' !== $this->get_option('enabled')) {
+                return false;
+            }
+
+            if (is_admin()) {
+                return true;
+            }
+
+            $gateway_id = $this->id;
+            $gateway_fee = Plugin::get_fee_for_current_cart($gateway_id);
+            $has_shipping_rule = ! empty(array_filter(Plugin::get_shipping_filters(), static function (array $rule) use ($gateway_id): bool {
+                return (string) ($rule['gateway_id'] ?? '') === $gateway_id;
+            }));
+
+            if ($gateway_fee <= 0 && ! $has_shipping_rule) {
+                return false;
+            }
+
+            return parent::is_available();
+        }
+    }
 }
 
 /**
@@ -96,9 +236,11 @@ final class Plugin
 
     /**
      * Új offline fizetési mód regisztrálása
-     */
+    */
     public function register_offline_gateway(array $gateways): array
     {
+        load_offline_gateway_class();
+
         foreach (self::get_offline_methods() as $method) {
             $class_name = $this->ensure_gateway_class($method);
             if ($class_name !== null) {
@@ -724,7 +866,12 @@ final class Plugin
             $methods = $zone['shipping_methods'] ?? [];
             foreach ($methods as $method) {
                 $key   = $method->id . ':' . $method->instance_id;
-                $label = sprintf('%s – %s', $zone_name, $method->get_method_title());
+                $title = $method->get_title();
+                if ($title === '') {
+                    $title = $method->get_method_title();
+                }
+
+                $label = sprintf('%s – %s', $zone_name, $title);
                 $options[$key] = $label;
             }
         }
@@ -734,7 +881,12 @@ final class Plugin
         $default_methods = $default_zone->get_shipping_methods();
         foreach ($default_methods as $method) {
             $key   = $method->id . ':' . $method->instance_id;
-            $label = sprintf('%s – %s', __('Rest of the world', 'ehz-wc-payment-fees'), $method->get_method_title());
+            $title = $method->get_title();
+            if ($title === '') {
+                $title = $method->get_method_title();
+            }
+
+            $label = sprintf('%s – %s', __('Rest of the world', 'ehz-wc-payment-fees'), $title);
             $options[$key] = $label;
         }
 
@@ -979,88 +1131,6 @@ final class Plugin
         }
 
         return sprintf('%s (+%s)', $title, wc_price($fee));
-    }
-}
-
-/**
- * Offline fizetési mód (ehz_wc_offline_cash)
- */
-final class OfflineGateway extends \WC_Payment_Gateway
-{
-    protected string $instructions = '';
-
-    public function __construct()
-    {
-        $config = Plugin::$gateway_configs[get_class($this)] ?? null;
-
-        $this->id                 = $config['id'] ?? 'ehz_wc_offline_cash';
-        $this->method_title       = $config['method_title'] ?? __('Offline payment (EHZ)', 'ehz-wc-payment-fees');
-        $this->method_description = $config['method_description'] ?? __('Custom offline payment method provided by EHZ plugin.', 'ehz-wc-payment-fees');
-        $this->has_fields         = false;
-
-        // Load the settings.
-        $this->init_form_fields();
-        $this->init_settings();
-
-        $this->title        = $this->get_option('title', $config['title'] ?? __('Offline payment', 'ehz-wc-payment-fees'));
-        $this->description  = $this->get_option('description', $config['description'] ?? '');
-        $this->instructions = $this->get_option('instructions', $config['instructions'] ?? '');
-        $this->enabled      = $this->get_option('enabled', $config['enabled'] ?? 'no');
-
-        add_action('woocommerce_update_options_payment_gateways_' . $this->id, [$this, 'process_admin_options']);
-    }
-
-    public function init_form_fields(): void
-    {
-        $this->form_fields = [
-            'enabled' => [
-                'title'   => __('Enable/Disable', 'ehz-wc-payment-fees'),
-                'type'    => 'checkbox',
-                'label'   => __('Enable this offline payment method', 'ehz-wc-payment-fees'),
-                'default' => 'no',
-            ],
-            'title' => [
-                'title'       => __('Title', 'ehz-wc-payment-fees'),
-                'type'        => 'text',
-                'description' => __('This controls the title which the user sees during checkout.', 'ehz-wc-payment-fees'),
-                'default'     => __('Offline payment', 'ehz-wc-payment-fees'),
-                'desc_tip'    => true,
-            ],
-            'description' => [
-                'title'       => __('Description', 'ehz-wc-payment-fees'),
-                'type'        => 'textarea',
-                'description' => __('Payment method description that the customer will see on your checkout.', 'ehz-wc-payment-fees'),
-                'default'     => '',
-                'desc_tip'    => true,
-            ],
-            'instructions' => [
-                'title'       => __('Instructions', 'ehz-wc-payment-fees'),
-                'type'        => 'textarea',
-                'description' => __('Instructions that will be added to the thank you page and emails.', 'ehz-wc-payment-fees'),
-                'default'     => '',
-                'desc_tip'    => true,
-            ],
-        ];
-    }
-
-    public function process_payment($order_id): array
-    {
-        $order = wc_get_order($order_id);
-
-        // Offline: a rendelést "on-hold" vagy "processing" státuszra lehet tenni, igény szerint.
-        $order->update_status('on-hold', __('Awaiting offline payment', 'ehz-wc-payment-fees'));
-
-        if ($this->instructions) {
-            $order->add_order_note(wp_kses_post($this->instructions));
-        }
-
-        // Kosár ürítése
-        \WC()->cart->empty_cart();
-
-        return [
-            'result'   => 'success',
-            'redirect' => $this->get_return_url($order),
-        ];
     }
 }
 
