@@ -1,0 +1,1 @@
+# ehz_wc_payment_method_price
