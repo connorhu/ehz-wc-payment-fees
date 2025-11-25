@@ -44,6 +44,16 @@ function bootstrap_ehz_wc_payment_fees(): void
 final class Plugin
 {
     private static ?self $instance = null;
+    private const OPTION_FEE_RULES = 'ehz_wc_payment_fee_rules';
+    private const OPTION_OFFLINE_METHODS = 'ehz_wc_offline_methods';
+    private const OPTION_SHIPPING_FILTERS = 'ehz_wc_payment_shipping_filters';
+
+    /**
+     * Gateway config tároló a dinamikusan generált osztályokhoz.
+     *
+     * @var array<string,array>
+     */
+    public static array $gateway_configs = [];
 
     public static function instance(): self
     {
@@ -61,18 +71,27 @@ final class Plugin
 
     private function init_hooks(): void
     {
-        // Új offline fizetési mód
+        // Új offline fizetési módok regisztrálása (dinamikusan definiálható)
         add_filter('woocommerce_payment_gateways', [$this, 'register_offline_gateway']);
 
         // Admin: beállítás oldal
         add_action('admin_menu', [$this, 'register_admin_menu']);
         add_action('admin_init', [$this, 'register_settings']);
 
+        // Admin: WooCommerce > Settings > Payments alá illesztett szekció
+        add_filter('woocommerce_get_sections_checkout', [$this, 'add_checkout_section']);
+        add_filter('woocommerce_get_settings_checkout', [$this, 'add_checkout_settings'], 10, 2);
+        add_action('woocommerce_admin_field_ehz_offline_methods', [$this, 'render_offline_methods_field']);
+        add_action('woocommerce_settings_save_checkout', [$this, 'handle_checkout_settings_save']);
+
         // Díj hozzáadása a kosárhoz
         add_action('woocommerce_cart_calculate_fees', [$this, 'add_fee_to_cart']);
 
         // Fizetési mód címének kiegészítése a díjjal
         add_filter('woocommerce_gateway_title', [$this, 'append_fee_to_gateway_title'], 10, 2);
+
+        // Fizetési módok szűrése szállítási mód alapján
+        add_filter('woocommerce_available_payment_gateways', [$this, 'filter_gateways_by_shipping']);
     }
 
     /**
@@ -80,8 +99,59 @@ final class Plugin
      */
     public function register_offline_gateway(array $gateways): array
     {
-        $gateways[] = OfflineGateway::class;
+        foreach (self::get_offline_methods() as $method) {
+            $class_name = $this->ensure_gateway_class($method);
+            if ($class_name !== null) {
+                $gateways[] = $class_name;
+            }
+        }
+
+        // Ha nincs definiált egyéni mód, biztosítunk egy alap offline metódust
+        if (empty(self::get_offline_methods())) {
+            $gateways[] = OfflineGateway::class;
+            self::$gateway_configs[OfflineGateway::class] = [
+                'id'                 => 'ehz_wc_offline_cash',
+                'title'              => __('Offline payment', 'ehz-wc-payment-fees'),
+                'description'        => '',
+                'instructions'       => '',
+                'enabled'            => 'no',
+                'method_title'       => __('Offline payment (EHZ)', 'ehz-wc-payment-fees'),
+                'method_description' => __('Custom offline payment method provided by EHZ plugin.', 'ehz-wc-payment-fees'),
+            ];
+        }
+
         return $gateways;
+    }
+
+    /**
+     * Dinamikus gateway osztály létrehozása az adott definícióhoz.
+     */
+    private function ensure_gateway_class(array $method): ?string
+    {
+        $id    = sanitize_title($method['id'] ?? $method['title'] ?? '');
+        $title = trim((string) ($method['title'] ?? ''));
+
+        if ($id === '' || $title === '') {
+            return null;
+        }
+
+        $class_name = __NAMESPACE__ . '\\OfflineGateway_' . preg_replace('/[^A-Za-z0-9_]/', '_', strtoupper($id));
+
+        if (! class_exists($class_name)) {
+            class_alias(OfflineGateway::class, $class_name);
+        }
+
+        self::$gateway_configs[$class_name] = [
+            'id'                 => $id,
+            'title'              => $title,
+            'description'        => (string) ($method['description'] ?? ''),
+            'instructions'       => (string) ($method['instructions'] ?? ''),
+            'enabled'            => (string) ($method['enabled'] ?? 'no'),
+            'method_title'       => __('Offline payment (EHZ)', 'ehz-wc-payment-fees'),
+            'method_description' => __('Custom offline payment method provided by EHZ plugin.', 'ehz-wc-payment-fees'),
+        ];
+
+        return $class_name;
     }
 
     /**
@@ -100,16 +170,66 @@ final class Plugin
     }
 
     /**
+     * WooCommerce Settings > Payments szekció bővítése.
+     */
+    public function add_checkout_section(array $sections): array
+    {
+        $sections['ehz_offline_methods'] = __('Offline payment methods (EHZ)', 'ehz-wc-payment-fees');
+
+        return $sections;
+    }
+
+    /**
+     * WooCommerce Settings > Payments > EHZ szekció mezőinek biztosítása.
+     */
+    public function add_checkout_settings(array $settings, string $current_section): array
+    {
+        if ($current_section !== 'ehz_offline_methods') {
+            return $settings;
+        }
+
+        $settings = [];
+        $settings[] = [
+            'title' => __('Offline payment methods', 'ehz-wc-payment-fees'),
+            'type'  => 'title',
+            'desc'  => __('Create any number of offline payment gateways with custom labels and instructions.', 'ehz-wc-payment-fees'),
+            'id'    => 'ehz_wc_offline_methods_title',
+        ];
+
+        $settings[] = [
+            'type' => 'ehz_offline_methods',
+            'id'   => self::OPTION_OFFLINE_METHODS,
+        ];
+
+        $settings[] = [
+            'type' => 'sectionend',
+            'id'   => 'ehz_wc_offline_methods_title',
+        ];
+
+        return $settings;
+    }
+
+    /**
      * Settings API regisztráció az option-hoz.
      */
     public function register_settings(): void
     {
         register_setting(
             'ehz_wc_payment_fees',
-            'ehz_wc_payment_fee_rules',
+            self::OPTION_FEE_RULES,
             [
                 'type'              => 'array',
                 'sanitize_callback' => [self::class, 'sanitize_fee_rules'],
+                'default'           => [],
+            ]
+        );
+
+        register_setting(
+            'ehz_wc_payment_fees',
+            self::OPTION_SHIPPING_FILTERS,
+            [
+                'type'              => 'array',
+                'sanitize_callback' => [self::class, 'sanitize_shipping_filters'],
                 'default'           => [],
             ]
         );
@@ -160,6 +280,38 @@ final class Plugin
     }
 
     /**
+     * Szállítási mód filter szabályainak szűrése.
+     */
+    public static function sanitize_shipping_filters($value): array
+    {
+        if (! is_array($value)) {
+            return [];
+        }
+
+        $sanitized = [];
+
+        foreach ($value as $row) {
+            if (! is_array($row)) {
+                continue;
+            }
+
+            $gateway_id   = isset($row['gateway_id']) ? sanitize_text_field((string) $row['gateway_id']) : '';
+            $shipping_key = isset($row['shipping_key']) ? sanitize_text_field((string) $row['shipping_key']) : '';
+
+            if ($gateway_id === '' || $shipping_key === '') {
+                continue;
+            }
+
+            $sanitized[] = [
+                'gateway_id'   => $gateway_id,
+                'shipping_key' => $shipping_key,
+            ];
+        }
+
+        return $sanitized;
+    }
+
+    /**
      * Admin oldal renderelése.
      *
      * Itt tudsz hozzárendelni: (payment gateway) + (shipping method) -> fee.
@@ -176,6 +328,7 @@ final class Plugin
 
         $shipping_method_options = $this->collect_shipping_method_options();
         $fee_rules = self::get_fee_rules();
+        $shipping_filters = self::get_shipping_filters();
         ?>
         <div class="wrap">
             <h1><?php esc_html_e('Payment fees by shipping method', 'ehz-wc-payment-fees'); ?></h1>
@@ -189,7 +342,8 @@ final class Plugin
                 settings_fields('ehz_wc_payment_fees');
                 ?>
 
-                <table class="widefat fixed" id="ehz-wc-fee-rules-table">
+                <h2><?php esc_html_e('Fee rules', 'ehz-wc-payment-fees'); ?></h2>
+                <table class="widefat fixed wc_input_table" id="ehz-wc-fee-rules-table">
                     <thead>
                     <tr>
                         <th><?php esc_html_e('Payment method', 'ehz-wc-payment-fees'); ?></th>
@@ -261,8 +415,72 @@ final class Plugin
                 </table>
 
                 <p>
-                    <button type="button" class="button button-secondary" id="ehz-wc-add-row">
+                    <button type="button" class="button button-secondary" data-add-row="ehz-wc-fee-rules-table">
                         <?php esc_html_e('Add rule', 'ehz-wc-payment-fees'); ?>
+                    </button>
+                </p>
+
+                <h2><?php esc_html_e('Payment method availability by shipping', 'ehz-wc-payment-fees'); ?></h2>
+                <p class="description">
+                    <?php esc_html_e('Restrict which payment methods appear for specific shipping services.', 'ehz-wc-payment-fees'); ?>
+                </p>
+                <table class="widefat fixed wc_input_table" id="ehz-wc-shipping-filters-table">
+                    <thead>
+                    <tr>
+                        <th><?php esc_html_e('Payment method', 'ehz-wc-payment-fees'); ?></th>
+                        <th><?php esc_html_e('Shipping method', 'ehz-wc-payment-fees'); ?></th>
+                        <th><?php esc_html_e('Actions', 'ehz-wc-payment-fees'); ?></th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    <?php
+                    if (empty($shipping_filters)) {
+                        $shipping_filters = [
+                            [
+                                'gateway_id'   => '',
+                                'shipping_key' => '',
+                            ],
+                        ];
+                    }
+
+                    foreach ($shipping_filters as $index => $rule) :
+                        $gateway_id   = isset($rule['gateway_id']) ? (string)$rule['gateway_id'] : '';
+                        $shipping_key = isset($rule['shipping_key']) ? (string)$rule['shipping_key'] : '';
+                        ?>
+                        <tr class="ehz-wc-shipping-filter-row">
+                            <td>
+                                <select name="<?php echo esc_attr(self::OPTION_SHIPPING_FILTERS); ?>[<?php echo esc_attr((string)$index); ?>][gateway_id]">
+                                    <option value=""><?php esc_html_e('Select…', 'ehz-wc-payment-fees'); ?></option>
+                                    <?php foreach ($gateways as $id => $gateway) : ?>
+                                        <option value="<?php echo esc_attr($id); ?>" <?php selected($id, $gateway_id); ?>>
+                                            <?php echo esc_html($gateway->get_title() . ' (' . $id . ')'); ?>
+                                        </option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </td>
+                            <td>
+                                <select name="<?php echo esc_attr(self::OPTION_SHIPPING_FILTERS); ?>[<?php echo esc_attr((string)$index); ?>][shipping_key]">
+                                    <option value=""><?php esc_html_e('Select…', 'ehz-wc-payment-fees'); ?></option>
+                                    <?php foreach ($shipping_method_options as $key => $label) : ?>
+                                        <option value="<?php echo esc_attr($key); ?>" <?php selected($key, $shipping_key); ?>>
+                                            <?php echo esc_html($label . ' [' . $key . ']'); ?>
+                                        </option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </td>
+                            <td>
+                                <button type="button" class="button ehz-wc-remove-row">
+                                    <?php esc_html_e('Remove', 'ehz-wc-payment-fees'); ?>
+                                </button>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+
+                <p>
+                    <button type="button" class="button button-secondary" data-add-row="ehz-wc-shipping-filters-table">
+                        <?php esc_html_e('Add restriction', 'ehz-wc-payment-fees'); ?>
                     </button>
                 </p>
 
@@ -271,43 +489,223 @@ final class Plugin
         </div>
         <script>
             (function () {
-                const tableBody = document.querySelector('#ehz-wc-fee-rules-table tbody');
-                const addBtn    = document.getElementById('ehz-wc-add-row');
+                const initTable = (tableId, rowClass) => {
+                    const tableBody = document.querySelector(`#${tableId} tbody`);
+                    if (!tableBody) {
+                        return;
+                    }
 
-                if (!tableBody || !addBtn) {
+                    tableBody.addEventListener('click', function (e) {
+                        const target = e.target;
+                        if (target && target.classList.contains('ehz-wc-remove-row')) {
+                            const row = target.closest('tr.' + rowClass);
+                            if (row && tableBody.querySelectorAll('tr.' + rowClass).length > 1) {
+                                row.remove();
+                            }
+                        }
+                    });
+                };
+
+                const addButtons = document.querySelectorAll('[data-add-row]');
+                addButtons.forEach(function (btn) {
+                    btn.addEventListener('click', function () {
+                        const targetId = btn.getAttribute('data-add-row');
+                        const tableBody = document.querySelector('#' + targetId + ' tbody');
+                        if (!tableBody) {
+                            return;
+                        }
+
+                        const rows = tableBody.querySelectorAll('tr');
+                        if (!rows.length) {
+                            return;
+                        }
+
+                        const template = rows[0].cloneNode(true);
+                        const newIndex = rows.length;
+
+                        template.querySelectorAll('select, input').forEach(function (el) {
+                            el.value = '';
+                            const name = el.getAttribute('name');
+                            if (name) {
+                                el.setAttribute('name', name.replace(/\[\d+]/, '[' + newIndex + ']'));
+                            }
+                        });
+
+                        tableBody.appendChild(template);
+                    });
+                });
+
+                initTable('ehz-wc-fee-rules-table', 'ehz-wc-fee-rule-row');
+                initTable('ehz-wc-shipping-filters-table', 'ehz-wc-shipping-filter-row');
+            })();
+        </script>
+        <?php
+    }
+
+    /**
+     * Offline fizetési módok mező kirajzolása WooCommerce Settings alatt.
+     */
+    public function render_offline_methods_field(): void
+    {
+        $methods = self::get_offline_methods();
+
+        if (empty($methods)) {
+            $methods = [
+                [
+                    'id'           => '',
+                    'title'        => '',
+                    'description'  => '',
+                    'instructions' => '',
+                    'enabled'      => 'yes',
+                ],
+            ];
+        }
+
+        ?>
+        <table class="widefat fixed wc_gateways wc_input_table" id="ehz-wc-offline-methods-table">
+            <thead>
+            <tr>
+                <th><?php esc_html_e('Identifier', 'ehz-wc-payment-fees'); ?></th>
+                <th><?php esc_html_e('Title', 'ehz-wc-payment-fees'); ?></th>
+                <th><?php esc_html_e('Description', 'ehz-wc-payment-fees'); ?></th>
+                <th><?php esc_html_e('Instructions', 'ehz-wc-payment-fees'); ?></th>
+                <th><?php esc_html_e('Enabled', 'ehz-wc-payment-fees'); ?></th>
+                <th><?php esc_html_e('Actions', 'ehz-wc-payment-fees'); ?></th>
+            </tr>
+            </thead>
+            <tbody>
+            <?php foreach ($methods as $index => $method) :
+                $id           = isset($method['id']) ? (string) $method['id'] : '';
+                $title        = isset($method['title']) ? (string) $method['title'] : '';
+                $description  = isset($method['description']) ? (string) $method['description'] : '';
+                $instructions = isset($method['instructions']) ? (string) $method['instructions'] : '';
+                $enabled      = isset($method['enabled']) ? (string) $method['enabled'] : 'yes';
+                ?>
+                <tr class="ehz-wc-offline-row">
+                    <td>
+                        <input type="text" name="<?php echo esc_attr(self::OPTION_OFFLINE_METHODS); ?>[<?php echo esc_attr((string)$index); ?>][id]" value="<?php echo esc_attr($id); ?>" placeholder="offline_cash" />
+                        <p class="description"><?php esc_html_e('Unique slug (characters, numbers, dash).', 'ehz-wc-payment-fees'); ?></p>
+                    </td>
+                    <td>
+                        <input type="text" name="<?php echo esc_attr(self::OPTION_OFFLINE_METHODS); ?>[<?php echo esc_attr((string)$index); ?>][title]" value="<?php echo esc_attr($title); ?>" />
+                    </td>
+                    <td>
+                        <textarea name="<?php echo esc_attr(self::OPTION_OFFLINE_METHODS); ?>[<?php echo esc_attr((string)$index); ?>][description]" rows="2" cols="20"><?php echo esc_textarea($description); ?></textarea>
+                    </td>
+                    <td>
+                        <textarea name="<?php echo esc_attr(self::OPTION_OFFLINE_METHODS); ?>[<?php echo esc_attr((string)$index); ?>][instructions]" rows="2" cols="20"><?php echo esc_textarea($instructions); ?></textarea>
+                        <p class="description"><?php esc_html_e('Shown on thank you page and emails.', 'ehz-wc-payment-fees'); ?></p>
+                    </td>
+                    <td>
+                        <label>
+                            <input type="checkbox" value="yes" name="<?php echo esc_attr(self::OPTION_OFFLINE_METHODS); ?>[<?php echo esc_attr((string)$index); ?>][enabled]" <?php checked($enabled, 'yes'); ?> />
+                            <?php esc_html_e('Enabled', 'ehz-wc-payment-fees'); ?>
+                        </label>
+                    </td>
+                    <td>
+                        <button type="button" class="button ehz-wc-remove-row"><?php esc_html_e('Remove', 'ehz-wc-payment-fees'); ?></button>
+                    </td>
+                </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+        <p>
+            <button type="button" class="button button-secondary" data-add-row="ehz-wc-offline-methods-table"><?php esc_html_e('Add payment method', 'ehz-wc-payment-fees'); ?></button>
+        </p>
+
+        <script>
+            (function () {
+                const table = document.querySelector('#ehz-wc-offline-methods-table tbody');
+                const addBtn = document.querySelector('[data-add-row="ehz-wc-offline-methods-table"]');
+
+                if (!table || !addBtn) {
                     return;
                 }
 
                 addBtn.addEventListener('click', function () {
-                    const rows = tableBody.querySelectorAll('tr.ehz-wc-fee-rule-row');
-                    const lastIndex = rows.length ? rows[rows.length - 1].rowIndex : 0;
-                    const newIndex = rows.length;
+                    const rows = table.querySelectorAll('tr');
+                    if (!rows.length) {
+                        return;
+                    }
 
                     const template = rows[0].cloneNode(true);
-                    // Reset values
-                    template.querySelectorAll('select, input').forEach(function (el) {
-                        el.value = '';
+                    const newIndex = rows.length;
+
+                    template.querySelectorAll('input, textarea').forEach(function (el) {
                         const name = el.getAttribute('name');
                         if (name) {
                             el.setAttribute('name', name.replace(/\[\d+]/, '[' + newIndex + ']'));
                         }
+                        if (el.type === 'checkbox') {
+                            el.checked = true;
+                        } else {
+                            el.value = '';
+                        }
                     });
 
-                    tableBody.appendChild(template);
+                    table.appendChild(template);
                 });
 
-                tableBody.addEventListener('click', function (e) {
+                table.addEventListener('click', function (e) {
                     const target = e.target;
                     if (target && target.classList.contains('ehz-wc-remove-row')) {
-                        const row = target.closest('tr.ehz-wc-fee-rule-row');
-                        if (row && tableBody.querySelectorAll('tr.ehz-wc-fee-rule-row').length > 1) {
-                            row.remove();
+                        const rows = table.querySelectorAll('tr');
+                        if (rows.length > 1) {
+                            target.closest('tr')?.remove();
                         }
                     }
                 });
             })();
         </script>
         <?php
+    }
+
+    /**
+     * WooCommerce settings mentésének kezelése az egyedi mezőhöz.
+     */
+    public function handle_checkout_settings_save(): void
+    {
+        $current_section = isset($_GET['section']) ? sanitize_text_field((string) $_GET['section']) : '';
+        if ($current_section !== 'ehz_offline_methods') {
+            return;
+        }
+
+        $raw_methods = $_POST[self::OPTION_OFFLINE_METHODS] ?? [];
+        update_option(self::OPTION_OFFLINE_METHODS, $this->sanitize_offline_methods($raw_methods));
+    }
+
+    /**
+     * Offline fizetési módok tisztítása/normalizálása.
+     */
+    private function sanitize_offline_methods($methods): array
+    {
+        if (! is_array($methods)) {
+            return [];
+        }
+
+        $sanitized = [];
+        foreach ($methods as $method) {
+            if (! is_array($method)) {
+                continue;
+            }
+
+            $id    = sanitize_title($method['id'] ?? $method['title'] ?? '');
+            $title = trim((string) ($method['title'] ?? ''));
+
+            if ($id === '' || $title === '') {
+                continue;
+            }
+
+            $sanitized[] = [
+                'id'           => $id,
+                'title'        => $title,
+                'description'  => sanitize_textarea_field((string) ($method['description'] ?? '')),
+                'instructions' => sanitize_textarea_field((string) ($method['instructions'] ?? '')),
+                'enabled'      => (isset($method['enabled']) && $method['enabled'] === 'yes') ? 'yes' : 'no',
+            ];
+        }
+
+        return $sanitized;
     }
 
     /**
@@ -355,8 +753,52 @@ final class Plugin
      */
     public static function get_fee_rules(): array
     {
-        $rules = get_option('ehz_wc_payment_fee_rules', []);
+        $rules = get_option(self::OPTION_FEE_RULES, []);
         return is_array($rules) ? $rules : [];
+    }
+
+    /**
+     * Option getter a szállítási filterekhez.
+     */
+    public static function get_shipping_filters(): array
+    {
+        $rules = get_option(self::OPTION_SHIPPING_FILTERS, []);
+        return is_array($rules) ? $rules : [];
+    }
+
+    /**
+     * Offline metódusok lekérdezése.
+     */
+    public static function get_offline_methods(): array
+    {
+        $methods = get_option(self::OPTION_OFFLINE_METHODS, []);
+        if (! is_array($methods)) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($methods as $method) {
+            if (! is_array($method)) {
+                continue;
+            }
+
+            $id    = sanitize_title($method['id'] ?? $method['title'] ?? '');
+            $title = trim((string) ($method['title'] ?? ''));
+
+            if ($id === '' || $title === '') {
+                continue;
+            }
+
+            $normalized[] = [
+                'id'           => $id,
+                'title'        => $title,
+                'description'  => (string) ($method['description'] ?? ''),
+                'instructions' => (string) ($method['instructions'] ?? ''),
+                'enabled'      => (string) ($method['enabled'] ?? 'no'),
+            ];
+        }
+
+        return $normalized;
     }
 
     /**
@@ -447,6 +889,43 @@ final class Plugin
     }
 
     /**
+     * Fizetési módok kiszűrése szállítási metódus alapján.
+     */
+    public function filter_gateways_by_shipping(array $available_gateways): array
+    {
+        if (is_admin()) {
+            return $available_gateways;
+        }
+
+        $chosen_shipping = \WC()->session->get('chosen_shipping_methods', []);
+        $shipping_key = (string) ($chosen_shipping[0] ?? '');
+
+        if ($shipping_key === '') {
+            return $available_gateways;
+        }
+
+        $shipping_id_only = str_contains($shipping_key, ':')
+            ? explode(':', $shipping_key)[0]
+            : $shipping_key;
+
+        foreach (self::get_shipping_filters() as $rule) {
+            $gateway_id = (string) ($rule['gateway_id'] ?? '');
+            $ship_rule  = (string) ($rule['shipping_key'] ?? '');
+
+            if ($gateway_id === '' || $ship_rule === '') {
+                continue;
+            }
+
+            $match = $ship_rule === $shipping_key || $ship_rule === $shipping_id_only;
+            if ($match && isset($available_gateways[$gateway_id])) {
+                unset($available_gateways[$gateway_id]);
+            }
+        }
+
+        return $available_gateways;
+    }
+
+    /**
      * Díj rátétele a kosárra.
      */
     public function add_fee_to_cart(\WC_Cart $cart): void
@@ -508,20 +987,25 @@ final class Plugin
  */
 final class OfflineGateway extends \WC_Payment_Gateway
 {
+    protected string $instructions = '';
+
     public function __construct()
     {
-        $this->id                 = 'ehz_wc_offline_cash';
-        $this->method_title       = __('Offline payment (EHZ)', 'ehz-wc-payment-fees');
-        $this->method_description = __('Custom offline payment method provided by EHZ plugin.', 'ehz-wc-payment-fees');
+        $config = Plugin::$gateway_configs[get_class($this)] ?? null;
+
+        $this->id                 = $config['id'] ?? 'ehz_wc_offline_cash';
+        $this->method_title       = $config['method_title'] ?? __('Offline payment (EHZ)', 'ehz-wc-payment-fees');
+        $this->method_description = $config['method_description'] ?? __('Custom offline payment method provided by EHZ plugin.', 'ehz-wc-payment-fees');
         $this->has_fields         = false;
 
         // Load the settings.
         $this->init_form_fields();
         $this->init_settings();
 
-        $this->title        = $this->get_option('title', __('Offline payment', 'ehz-wc-payment-fees'));
-        $this->description  = $this->get_option('description', '');
-        $this->enabled      = $this->get_option('enabled', 'no');
+        $this->title        = $this->get_option('title', $config['title'] ?? __('Offline payment', 'ehz-wc-payment-fees'));
+        $this->description  = $this->get_option('description', $config['description'] ?? '');
+        $this->instructions = $this->get_option('instructions', $config['instructions'] ?? '');
+        $this->enabled      = $this->get_option('enabled', $config['enabled'] ?? 'no');
 
         add_action('woocommerce_update_options_payment_gateways_' . $this->id, [$this, 'process_admin_options']);
     }
@@ -549,6 +1033,13 @@ final class OfflineGateway extends \WC_Payment_Gateway
                 'default'     => '',
                 'desc_tip'    => true,
             ],
+            'instructions' => [
+                'title'       => __('Instructions', 'ehz-wc-payment-fees'),
+                'type'        => 'textarea',
+                'description' => __('Instructions that will be added to the thank you page and emails.', 'ehz-wc-payment-fees'),
+                'default'     => '',
+                'desc_tip'    => true,
+            ],
         ];
     }
 
@@ -558,6 +1049,10 @@ final class OfflineGateway extends \WC_Payment_Gateway
 
         // Offline: a rendelést "on-hold" vagy "processing" státuszra lehet tenni, igény szerint.
         $order->update_status('on-hold', __('Awaiting offline payment', 'ehz-wc-payment-fees'));
+
+        if ($this->instructions) {
+            $order->add_order_note(wp_kses_post($this->instructions));
+        }
 
         // Kosár ürítése
         \WC()->cart->empty_cart();
